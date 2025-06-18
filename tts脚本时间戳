@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
-"""Batch‑transcribe videos in leaf directories using **Hugging Face Transformers**
-   with the `openai/whisper‑large‑v3` checkpoint (or any other Whisper ID).
+"""Batch‑transcribe videos in leaf directories **with word/segment timestamps**
+   using whisper‑timestamped. Outputs a plain‑text file *and* an SRT subtitle file
+   for each selected video.
 
-   ─────────────────────────────────────────────────────────────────────────────
-   • Generates **plain TXT** and **SRT subtitles with sentence timestamps**
-   • Supports **single‑GPU** (e.g. `cuda:1`) **or multi‑GPU** (e.g. `1,2`) loading
-   • Long audio handled via the *chunked* algorithm (30‑s windows)
+   Usage examples
+   -------------
+   # 全部视频 → TXT+SRT
+   python transcribe_leaf_videos_timestamped.py /data2/train_data \
+       --model small --language zh --device cuda
 
-   Usage
-   -----
-   # 单 GPU：第 1 号卡
-   python transcribe_leaf_videos_hf.py /data2/train_data --device cuda:1
+   # 仅转写第 1‑3, 8, 20‑23 个视频
+   python transcribe_leaf_videos_timestamped.py /data2/train_data \
+       --select 1-3,8,20-23 --model medium --language zh --device cuda
 
-   # 多 GPU：第 1 和第 2 号卡一起（显存足够时更快）
-   python transcribe_leaf_videos_hf.py /data2/train_data --device 1,2 --batch-size 32
-
-   # CPU 回退
-   python transcribe_leaf_videos_hf.py /data2/train_data --device cpu
-
-   Dependencies
+   Requirements
    ------------
-   pip install -U transformers datasets[audio] accelerate torch tqdm
+   pip install -U whisper-timestamped tqdm torch
    sudo apt-get install ffmpeg
 """
-
-from __future__ import annotations
 
 import argparse
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
+from whisper_timestamped import load_model, transcribe_timestamped
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 # --------------------------------------------------------------------------------------
 # Config
@@ -42,17 +36,16 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 VIDEO_EXTENSIONS: Set[str] = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".webm", ".mpg", ".mpeg", ".mpga", ".wav",
 }
-DEFAULT_MODEL_ID = "openai/whisper-large-v3"
 
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
 
 def find_leaf_video_files(root: Path) -> List[Path]:
-    """Return sorted list of video files located in **leaf** directories (no sub‑dirs)."""
+    """Return *sorted* list of video files located in **leaf** directories (no sub‑dirs)."""
     leaf_videos: List[Path] = []
     for current, dirs, files in os.walk(root):
-        if not dirs:
+        if not dirs:  # leaf dir
             for fname in files:
                 if Path(fname).suffix.lower() in VIDEO_EXTENSIONS:
                     leaf_videos.append(Path(current) / fname)
@@ -60,146 +53,144 @@ def find_leaf_video_files(root: Path) -> List[Path]:
 
 
 def parse_selection(sel: str, total: int) -> List[int]:
-    """Convert selection string → 0‑based indices list."""
+    """Parse a selection string into 0‑based indices.
+
+    Supported formats
+    -----------------
+    - "all" / "*" / "" → select all
+    - "1-10,15,20-23"   → multiple ranges / single points (1‑based)
+    """
     sel = sel.strip().lower()
     if sel in {"all", "*", ""}:
         return list(range(total))
 
-    idx_set: Set[int] = set()
+    indices: Set[int] = set()
     for part in sel.split(','):
         part = part.strip()
         if not part:
             continue
         if '-' in part:
             a, b = part.split('-', 1)
-            start, end = int(a) - 1, int(b) - 1
-            if start < 0 or start > end:
+            try:
+                start = int(a) - 1
+                end = int(b) - 1
+            except ValueError:
+                raise ValueError(f"区间 '{part}' 不是有效数字")
+            if start > end or start < 0:
                 raise ValueError(f"无效区间 '{part}'")
-            idx_set.update(range(start, end + 1))
+            indices.update(range(start, end + 1))
         else:
-            idx = int(part) - 1
-            if idx < 0:
-                raise ValueError(f"无效索引 '{part}'")
-            idx_set.add(idx)
-    return sorted(i for i in idx_set if i < total)
+            try:
+                idx = int(part) - 1
+            except ValueError:
+                raise ValueError(f"索引 '{part}' 不是有效数字")
+            indices.add(idx)
+    return sorted(i for i in indices if 0 <= i < total)
 
-# --------------------------------------------------------------------------------------
-# Timestamp util
-# --------------------------------------------------------------------------------------
 
-def srt_time(sec: float) -> str:
-    ms = int(round(sec * 1000))
-    h = ms // 3_600_000
-    m = (ms % 3_600_000) // 60_000
-    s = (ms % 60_000) // 1000
-    ms %= 1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def transcribe(file_path: Path, model, *, language: Optional[str] = None):
+    """Transcribe a single video and return the *full result* dict (segments+words)."""
+    return transcribe_timestamped(model, str(file_path), language=language)
 
-# --------------------------------------------------------------------------------------
-# Pipeline loader
-# --------------------------------------------------------------------------------------
 
-def load_pipeline(model_id: str, device_arg: str, chunk_len: int, batch_size: int):
-    """Return a HuggingFace *pipeline* with optional multi‑GPU support."""
-
-    # ---------- interpret device_arg ----------
-    if device_arg == "cpu":
-        device_map = None
-        target_device = "cpu"
-    elif "," in device_arg:  # multi‑GPU, e.g. "1,2"
-        os.environ["CUDA_VISIBLE_DEVICES"] = device_arg  # restrict visible GPUs
-        device_map = "auto"  # let Accelerate split across all visible cards
-        target_device = "cuda"
-    else:  # single GPU string like "cuda" or "cuda:1"
-        device_map = None
-        target_device = device_arg if device_arg.startswith("cuda") else "cuda"
-
-    torch_dtype = torch.float16 if target_device.startswith("cuda") else torch.float32
-
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-        device_map=device_map,  # None for single‑GPU/CPU, "auto" for multi‑GPU
-    )
-
-    # If single device, move entire model
-    if device_map is None and target_device != "cpu":
-        model.to(target_device)
-
-    processor = AutoProcessor.from_pretrained(model_id)
-
-    return pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        chunk_length_s=chunk_len,
-        batch_size=batch_size,
-        torch_dtype=torch_dtype,
-        device=0 if target_device.startswith("cuda") else -1,  # pipeline arg
-    )
-
-# --------------------------------------------------------------------------------------
-# Transcribe single file
-# --------------------------------------------------------------------------------------
-
-def transcribe_file(pipe, path: Path, lang: Optional[str]):
-    kw = {"language": lang} if lang else {}
-    return pipe(str(path), return_timestamps=True, generate_kwargs=kw)
+def srt_timestamp(sec: float) -> str:
+    """Convert seconds → 'HH:MM:SS,mmm' for SRT files.
+    Handles both integer and fractional seconds safely."""
+    total_ms = int(round(sec * 1000))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    seconds = (total_ms % 60_000) // 1000
+    ms = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{ms:03d}"
 
 # --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 
-def main():
-    p = argparse.ArgumentParser(description="Transcribe videos → TXT + SRT (HF Whisper)")
-    p.add_argument("root_dir", type=Path, help="根目录路径")
-    p.add_argument("--select", default="all", help="处理哪些文件，如 '1-5,8' or all")
-    p.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Hugging Face 模型 ID")
-    p.add_argument("--device", default=None, help="cuda, cuda:1 or '1,2' for multi")
-    p.add_argument("--language", default=None, help="提示音频语言，如 zh")
-    p.add_argument("--out-dir", type=Path, default=Path("./output_tts"))
-    p.add_argument("--chunk-len", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--overwrite", action="store_true")
-    args = p.parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Transcribe videos in leaf directories with Whisper‑timestamped "
+                    "(supports subset selection & outputs TXT + SRT).")
+    parser.add_argument("root_dir", type=Path, help="根目录路径")
 
-    # Decide device default
-    device_arg = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading model {args.model_id} on {device_arg} …")
-    pipe = load_pipeline(args.model_id, device_arg, args.chunk_len, args.batch_size)
+    parser.add_argument("--select", type=str, default="all",
+                        help="选择要处理的视频编号，格式如 '1-10,15,20-23'，默认 all")
+    parser.add_argument("--model", type=str, default="large",
+                        help="Whisper 模型尺寸 (tiny | base | small | medium | large)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="运算设备 (cuda | cpu)。默认自动检测。")
+    parser.add_argument("--language", type=str, default=None,
+                        help="语言提示，例如 zh, en …")
+    parser.add_argument("--out-dir", type=Path, default=Path("/home/kede/2025/output_tts_初级会计"),
+                        help="统一输出目录，不指定则写到视频所在目录")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="若目标文件已存在则覆盖 (TXT & SRT)")
 
+    args = parser.parse_args()
+
+    # Load model
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading Whisper‑timestamped model '{args.model}' on {device} …")
+    model = load_model(args.model, device=device)
+
+    # Find videos
     videos = find_leaf_video_files(args.root_dir)
     if not videos:
-        print("未找到视频文件，结束。"); return
+        print("未找到视频文件，结束。")
+        return
 
-    sel_idx = parse_selection(args.select, len(videos))
-    if not sel_idx:
-        print("没有任何视频被选中，结束。"); return
+    print("\n视频列表（共 %d 个）:" % len(videos))
+    for i, vid in enumerate(videos, 1):
+        print(f"[{i:>3}] {vid}")
 
-    print(f"将处理 {len(sel_idx)} 个文件 …\n")
+    # Parse selection
+    try:
+        selected_indices = parse_selection(args.select, len(videos))
+    except ValueError as e:
+        print("选择参数错误:", e)
+        sys.exit(1)
 
-    for i_idx in tqdm(sel_idx, desc="Transcribing"):
-        vid = videos[i_idx]
-        out_dir = args.out_dir or vid.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        txt_f = out_dir / f"{vid.stem}.txt"
-        srt_f = out_dir / f"{vid.stem}.srt"
-        if not args.overwrite and txt_f.exists() and srt_f.exists():
-            tqdm.write(f"[SKIP] {vid} 已存在输出文件。")
+    if not selected_indices:
+        print("没有任何视频被选中，结束。")
+        return
+
+    print("\n将处理 %d 个视频 → %s\n" % (len(selected_indices), args.select))
+
+    for idx in tqdm(selected_indices, desc="Transcribing"):
+        video = videos[idx]
+        target_dir = args.out_dir or video.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        txt_path = target_dir / (video.stem + ".txt")
+        srt_path = target_dir / (video.stem + ".srt")
+
+        if not args.overwrite and txt_path.exists() and srt_path.exists():
+            tqdm.write(f"[SKIP] {video} 已存在 TXT & SRT。")
             continue
+
         try:
-            res = transcribe_file(pipe, vid, args.language)
-            txt_f.write_text(res["text"].strip(), encoding="utf-8")
-            with srt_f.open("w", encoding="utf-8") as srt:
-                for n, c in enumerate(res.get("chunks", []), 1):
-                    b, e = c["timestamp"]
-                    srt.write(f"{n}\n{srt_time(b)} --> {srt_time(e)}\n{c['text'].strip()}\n\n")
-            tqdm.write(f"[OK] {vid.name} → TXT+SRT")
+            result = transcribe(video, model, language=args.language)
+
+            # Write plain text (concatenate segment texts)
+            plain_text = "".join(seg["text"] for seg in result["segments"]).strip()
+            txt_path.write_text(plain_text, encoding="utf-8")
+
+            # Write SRT subtitle file
+            with srt_path.open("w", encoding="utf-8") as f:
+                for i, seg in enumerate(result["segments"], 1):
+                    f.write(f"{i}\n")
+                    f.write(f"{srt_timestamp(seg['start'])} --> {srt_timestamp(seg['end'])}\n")
+                    f.write(seg["text"].strip() + "\n\n")
+
+            tqdm.write(f"[OK] {video} → {txt_path.name}, {srt_path.name}")
         except Exception as exc:
-            tqdm.write(f"[ERROR] {vid.name}: {exc}")
+            tqdm.write(f"[ERROR] {video}: {exc}")
+
+# --------------------------------------------------------------------------------------
+# Entry‑point
+# --------------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
+
+# python /home/语音转化文字加时间戳.py  /data2/ 
