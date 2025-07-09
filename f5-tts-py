@@ -310,9 +310,9 @@ if __name__ == "__main__":
         
         # 示例配置
         model = "F5TTS_v1_Base"
-        ref_audio = "/home/kede/2025/F5-TTS/voice_leijun.wav"
+        ref_audio = "voice_leijun.wav"
         ref_text = "如果你想做一件事，就先去干， 哪怕做的很烂，哪怕一点都不完美，一个粗糙的开始就是最好的开始"
-        gen_text = "你好，200+251=451这个数学很简单。我是通过AI技术创建的数字人。这是一个测试视频，展示了如何使用HeyGem来创建个性化的数字人视频内容。技术改变世界，AI让未来更精彩。"
+        gen_text = "我是通过AI技术创建的数字人。这是一个测试视频，展示了如何使用HeyGem来创建个性化的数字人视频内容。技术改变世界，AI让未来更精彩。"
         output_dir = "./output_f5_tts"
         
         print(f"\n📝 命令行使用示例:")
