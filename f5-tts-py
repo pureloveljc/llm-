@@ -92,35 +92,40 @@ def convert_number_with_cn2an(num_str):
 
 def convert_math_expression(expr_str):
     """
-    转换数学表达式
+    转换数学表达式，正确处理运算符和数字
     """
+    print(f"  🧮 处理数学表达式: {expr_str}")
+    
     try:
-        # 分离表达式和结果
-        if '=' in expr_str:
-            expression, result = expr_str.split('=', 1)
-        else:
-            expression = expr_str
-            result = None
+        # 清理输入
+        expr_str = expr_str.strip()
         
-        # 替换运算符
-        chinese_expr = expression.strip()
-        chinese_expr = re.sub(r'\+', ' 加 ', chinese_expr)
-        chinese_expr = re.sub(r'-', ' 减 ', chinese_expr)
-        chinese_expr = re.sub(r'\*', ' 乘以 ', chinese_expr)
-        chinese_expr = re.sub(r'/', ' 除以 ', chinese_expr)
+        # 更精确的运算符替换（使用单词边界）
+        result = expr_str
+        result = re.sub(r'\+', ' 加 ', result)
+        result = re.sub(r'-', ' 减 ', result)  
+        result = re.sub(r'\*', ' 乘以 ', result)
+        result = re.sub(r'/', ' 除以 ', result)
+        result = re.sub(r'=', ' 等于 ', result)
         
-        # 转换表达式中的数字
-        number_pattern = r'\d+(?:\.\d+)?'
-        chinese_expr = re.sub(number_pattern, 
-                             lambda m: convert_number_with_cn2an(m.group()), 
-                             chinese_expr)
+        print(f"    运算符替换后: {result}")
         
-        # 处理结果部分
-        if result:
-            chinese_result = convert_number_with_cn2an(result.strip())
-            return chinese_expr + ' 等于 ' + chinese_result
-        else:
-            return chinese_expr
+        # 转换数字部分
+        number_pattern = r'\b\d+(?:\.\d+)?\b'
+        
+        def replace_number(match):
+            num = match.group()
+            chinese_num = convert_number_with_cn2an(num)
+            print(f"      数字转换: {num} → {chinese_num}")
+            return chinese_num
+        
+        final_result = re.sub(number_pattern, replace_number, result)
+        
+        # 清理多余空格
+        final_result = re.sub(r'\s+', ' ', final_result).strip()
+        
+        print(f"    最终表达式: {final_result}")
+        return final_result
             
     except Exception as e:
         print(f"⚠️  表达式转换警告: {expr_str} → {e}")
@@ -128,43 +133,83 @@ def convert_math_expression(expr_str):
 
 def convert_text_numbers_cn2an(text):
     """
-    使用cn2an转换文本中的所有数字
+    使用cn2an转换文本中的所有数字，正确处理数学符号
+    修复版本：确保 200+251=451 → 二百 加 二百五十一 等于 四百五十一
     """
     print(f"\n📝 开始转换文本中的数字...")
     print(f"原始文本: {text}")
     
-    # 方法1: 使用cn2an的transform功能（推荐）
+    # 精确匹配数学表达式的模式
+    patterns = [
+        r'(\d+)\s*\+\s*(\d+)\s*=\s*(\d+)',  # 加法等式：200+251=451
+        r'(\d+)\s*-\s*(\d+)\s*=\s*(\d+)',   # 减法等式
+        r'(\d+)\s*\*\s*(\d+)\s*=\s*(\d+)',  # 乘法等式
+        r'(\d+)\s*/\s*(\d+)\s*=\s*(\d+)',   # 除法等式
+        r'(\d+)\s*\+\s*(\d+)',              # 加法表达式：200+251
+        r'(\d+)\s*-\s*(\d+)',               # 减法表达式
+        r'(\d+)\s*\*\s*(\d+)',              # 乘法表达式
+        r'(\d+)\s*/\s*(\d+)'                # 除法表达式
+    ]
+    
+    result = text
+    
+    # 逐个处理每种数学表达式模式
+    for pattern in patterns:
+        matches = re.finditer(pattern, result)
+        for match in reversed(list(matches)):  # 从后往前替换，避免位置偏移
+            original = match.group(0)
+            print(f"  🧮 找到数学表达式: {original}")
+            
+            # 根据运算符类型进行转换
+            if '=' in original and '+' in original:
+                num1, num2, result_num = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 加 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+            elif '=' in original and '-' in original:
+                num1, num2, result_num = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 减 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+            elif '=' in original and '*' in original:
+                num1, num2, result_num = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 乘以 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+            elif '=' in original and '/' in original:
+                num1, num2, result_num = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 除以 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+            elif '+' in original:
+                num1, num2 = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 加 {cn2an.an2cn(int(num2))}"
+            elif '-' in original:
+                num1, num2 = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 减 {cn2an.an2cn(int(num2))}"
+            elif '*' in original:
+                num1, num2 = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 乘以 {cn2an.an2cn(int(num2))}"
+            elif '/' in original:
+                num1, num2 = match.groups()
+                converted = f"{cn2an.an2cn(int(num1))} 除以 {cn2an.an2cn(int(num2))}"
+            else:
+                converted = original  # 如果无法识别，保持原样
+            
+            print(f"      转换为: {converted}")
+            
+            # 替换原文中的表达式
+            start, end = match.span()
+            result = result[:start] + converted + result[end:]
+    
+    print(f"数学表达式处理后: {result}")
+    
+    # 处理剩余的单独数字
     try:
-        # cn2an.transform 可以智能识别并转换文本中的数字
-        result = cn2an.transform(text, "an2cn")
-        print(f"cn2an.transform结果: {result}")
-        
-        # 额外处理数学表达式
-        math_pattern = r'\b\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?:\s*=\s*\d+(?:\.\d+)?)?\b'
-        
-        def replace_math(match):
-            return convert_math_expression(match.group())
-        
-        final_result = re.sub(math_pattern, replace_math, result)
+        final_result = cn2an.transform(result, "an2cn")
         print(f"最终结果: {final_result}")
-        
         return final_result
         
     except Exception as e:
-        print(f"❌ cn2an.transform 转换失败: {e}")
+        print(f"❌ cn2an.transform 处理剩余数字失败: {e}")
         
-        # 方法2: 手动处理（备用方案）
-        print("🔄 使用手动转换方案...")
-        
-        # 先处理数学表达式
-        math_pattern = r'\b\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?:\s*=\s*\d+(?:\.\d+)?)?\b'
-        result = re.sub(math_pattern, lambda m: convert_math_expression(m.group()), text)
-        
-        # 再处理剩余的单独数字
+        # 备用方案：手动处理剩余数字
         number_pattern = r'\b\d+(?:\.\d+)?\b'
-        result = re.sub(number_pattern, lambda m: convert_number_with_cn2an(m.group()), result)
-        
-        return result
+        final_result = re.sub(number_pattern, lambda m: convert_number_with_cn2an(m.group()), result)
+        print(f"备用方案结果: {final_result}")
+        return final_result
 
 def run_f5_tts_with_cn2an(model, ref_audio, ref_text, gen_text, output_dir):
     """
