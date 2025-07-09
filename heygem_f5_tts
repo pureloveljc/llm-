@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HeyGem 完整版 Python API 调用脚本 - F5-TTS集成版
+将原有的TTS合成替换为F5-TTS，获得更好的语音克隆效果
+"""
+
+import requests
+import json
+import time
+import uuid
+import os
+import shutil
+import subprocess
+import re
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+# F5-TTS 和数字转换相关依赖
+try:
+    import cn2an
+    print("✅ cn2an 库加载成功")
+except ImportError:
+    print("❌ 错误: 未安装 cn2an 库")
+    print("请安装: pip install cn2an")
+    exit(1)
+
+
+class HeyGemF5TTSAPI:
+    """HeyGem F5-TTS 集成版 API 客户端类"""
+    
+    def __init__(self, base_url: str = "http://127.0.0.1"):
+        self.base_url = base_url
+        self.video_port = 8383
+        self.mount_root = Path("/home/kede/heygem_data")
+        self.container_root = "/code/data"
+        
+        # 只保留视频相关的API端点，语音合成改用F5-TTS
+        self.endpoints = {
+            'video_submit': f"{base_url}:{self.video_port}/easy/submit",
+            'video_query': f"{base_url}:{self.video_port}/easy/query"
+        }
+        
+        # 工作目录
+        self.face_data_dir = "/home/kede/heygem_data/face2face"
+        self.f5_tts_output_dir = "/home/kede/heygem_data/f5_tts_output"
+        
+        # F5-TTS 配置
+        self.f5_tts_model = "F5TTS_v1_Base"
+        
+    def check_services(self) -> Dict[str, bool]:
+        """检查服务状态"""
+        services = {}
+        
+        # 检查视频服务  
+        try:
+            response = requests.get(f"{self.base_url}:{self.video_port}/", timeout=10)
+            services['video'] = response.status_code in [200, 404, 405]
+        except Exception:
+            services['video'] = False
+        
+        # 检查F5-TTS命令是否可用
+        try:
+            result = subprocess.run(['f5-tts_infer-cli', '--help'], 
+                                  capture_output=True, timeout=10)
+            services['f5_tts'] = result.returncode == 0
+        except Exception:
+            services['f5_tts'] = False
+            
+        return services
+    
+    def validate_ref_audio(self, ref_audio_path: str) -> bool:
+        """验证参考音频文件是否存在且可用"""
+        if not os.path.exists(ref_audio_path):
+            print(f"❌ 参考音频文件不存在: {ref_audio_path}")
+            return False
+            
+        if os.path.getsize(ref_audio_path) == 0:
+            print(f"❌ 参考音频文件为空: {ref_audio_path}")
+            return False
+            
+        print(f"✅ 参考音频文件验证通过: {ref_audio_path}")
+        return True
+    
+    def prepare_video_file(self, video_path: str) -> str:
+        """准备视频文件到指定目录"""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"视频文件不存在: {video_path}")
+            
+        # 创建目标目录
+        os.makedirs(self.face_data_dir, exist_ok=True)
+        
+        # 生成新的文件名
+        timestamp = int(time.time())
+        file_name = f"video_{timestamp}.mp4"
+        target_path = os.path.join(self.face_data_dir, file_name)
+        
+        # 复制文件
+        shutil.copy2(video_path, target_path)
+        print(f"✅ 视频文件已准备: {target_path}")
+        
+        return target_path
+    
+    def convert_number_with_cn2an(self, num_str):
+        """使用cn2an转换单个数字"""
+        try:
+            # 处理小数
+            if '.' in num_str:
+                integer_part, decimal_part = num_str.split('.')
+                chinese_integer = cn2an.an2cn(int(integer_part))
+                # 小数部分逐位转换
+                chinese_decimal = '点' + ''.join([cn2an.an2cn(int(d)) for d in decimal_part])
+                return chinese_integer + chinese_decimal
+            else:
+                # 整数直接转换
+                return cn2an.an2cn(int(num_str))
+        except Exception as e:
+            print(f"⚠️  数字转换警告: {num_str} → {e}")
+            return num_str  # 转换失败时返回原数字
+
+    def convert_text_numbers_cn2an(self, text):
+        """
+        使用cn2an转换文本中的所有数字，正确处理数学符号
+        修复版本：确保 200+251=451 → 二百 加 二百五十一 等于 四百五十一
+        """
+        print(f"\n📝 开始转换文本中的数字...")
+        print(f"原始文本: {text}")
+        
+        # 精确匹配数学表达式的模式
+        patterns = [
+            r'(\d+)\s*\+\s*(\d+)\s*=\s*(\d+)',  # 加法等式：200+251=451
+            r'(\d+)\s*-\s*(\d+)\s*=\s*(\d+)',   # 减法等式
+            r'(\d+)\s*\*\s*(\d+)\s*=\s*(\d+)',  # 乘法等式
+            r'(\d+)\s*/\s*(\d+)\s*=\s*(\d+)',   # 除法等式
+            r'(\d+)\s*\+\s*(\d+)',              # 加法表达式：200+251
+            r'(\d+)\s*-\s*(\d+)',               # 减法表达式
+            r'(\d+)\s*\*\s*(\d+)',              # 乘法表达式
+            r'(\d+)\s*/\s*(\d+)'                # 除法表达式
+        ]
+        
+        result = text
+        
+        # 逐个处理每种数学表达式模式
+        for pattern in patterns:
+            matches = re.finditer(pattern, result)
+            for match in reversed(list(matches)):  # 从后往前替换，避免位置偏移
+                original = match.group(0)
+                print(f"  🧮 找到数学表达式: {original}")
+                
+                # 根据运算符类型进行转换
+                if '=' in original and '+' in original:
+                    num1, num2, result_num = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 加 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+                elif '=' in original and '-' in original:
+                    num1, num2, result_num = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 减 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+                elif '=' in original and '*' in original:
+                    num1, num2, result_num = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 乘以 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+                elif '=' in original and '/' in original:
+                    num1, num2, result_num = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 除以 {cn2an.an2cn(int(num2))} 等于 {cn2an.an2cn(int(result_num))}"
+                elif '+' in original:
+                    num1, num2 = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 加 {cn2an.an2cn(int(num2))}"
+                elif '-' in original:
+                    num1, num2 = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 减 {cn2an.an2cn(int(num2))}"
+                elif '*' in original:
+                    num1, num2 = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 乘以 {cn2an.an2cn(int(num2))}"
+                elif '/' in original:
+                    num1, num2 = match.groups()
+                    converted = f"{cn2an.an2cn(int(num1))} 除以 {cn2an.an2cn(int(num2))}"
+                else:
+                    converted = original  # 如果无法识别，保持原样
+                
+                print(f"      转换为: {converted}")
+                
+                # 替换原文中的表达式
+                start, end = match.span()
+                result = result[:start] + converted + result[end:]
+        
+        print(f"数学表达式处理后: {result}")
+        
+        # 处理剩余的单独数字
+        try:
+            final_result = cn2an.transform(result, "an2cn")
+            print(f"最终结果: {final_result}")
+            return final_result
+            
+        except Exception as e:
+            print(f"❌ cn2an.transform 处理剩余数字失败: {e}")
+            
+            # 备用方案：手动处理剩余数字
+            number_pattern = r'\b\d+(?:\.\d+)?\b'
+            final_result = re.sub(number_pattern, lambda m: self.convert_number_with_cn2an(m.group()), result)
+            print(f"备用方案结果: {final_result}")
+            return final_result
+    
+    def synthesize_voice_with_f5tts(self, text: str, ref_audio_path: str, ref_text: str) -> Optional[str]:
+        """
+        步骤2: 使用F5-TTS进行语音合成
+        替换原有的HeyGem TTS API调用
+        """
+        print(f"🔄 开始F5-TTS语音合成: {text[:50]}...")
+        
+        # 验证参考音频文件
+        if not self.validate_ref_audio(ref_audio_path):
+            return None
+            
+        # 预处理文本：转换数字
+        processed_text = self.convert_text_numbers_cn2an(text)
+        
+        # 创建输出目录
+        os.makedirs(self.f5_tts_output_dir, exist_ok=True)
+        
+        # 生成输出文件名
+        timestamp = int(time.time())
+        output_filename = f"generated_audio_{timestamp}.wav"
+        
+        # 构建F5-TTS命令
+        cmd = [
+            "f5-tts_infer-cli",
+            "--model", self.f5_tts_model,
+            "--ref_audio", ref_audio_path,
+            "--ref_text", ref_text,
+            "--gen_text", processed_text,
+            "--output_dir", self.f5_tts_output_dir
+        ]
+        
+        print(f"📤 F5-TTS命令参数:")
+        print(f"   模型: {self.f5_tts_model}")
+        print(f"   参考音频: {ref_audio_path}")
+        print(f"   参考文本: {ref_text}")
+        print(f"   生成文本: {processed_text}")
+        print(f"   输出目录: {self.f5_tts_output_dir}")
+        
+        try:
+            # 执行F5-TTS推理
+            print("🚀 执行F5-TTS推理...")
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=300)
+            
+            if result.returncode == 0:
+                print("✅ F5-TTS语音合成成功！")
+                
+                # 查找生成的音频文件
+                # F5-TTS通常会生成一个以时间戳命名的文件
+                output_files = list(Path(self.f5_tts_output_dir).glob("*.wav"))
+                if output_files:
+                    # 获取最新生成的文件
+                    latest_file = max(output_files, key=os.path.getctime)
+                    print(f"🎵 生成的音频文件: {latest_file}")
+                    return str(latest_file)
+                else:
+                    print("❌ 未找到生成的音频文件")
+                    return None
+                    
+            else:
+                print(f"❌ F5-TTS语音合成失败: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            print("❌ F5-TTS执行超时")
+            return None
+        except Exception as e:
+            print(f"❌ F5-TTS执行异常: {e}")
+            return None
+    
+    def submit_video_synthesis(self, audio_path: str, video_path: str) -> Optional[str]:
+        """
+        步骤3: 提交视频合成任务
+        """
+        print("🔄 提交视频合成任务...")
+        
+        # 生成任务ID
+        task_id = str(uuid.uuid4())
+        
+        # 处理音频路径
+        if os.path.exists(audio_path):
+            # 复制音频文件到视频服务可访问的目录
+            audio_filename = f"f5tts_audio_{int(time.time())}.wav"
+            target_audio_path = os.path.join(self.face_data_dir, audio_filename)
+            shutil.copy2(audio_path, target_audio_path)
+            print(f"📁 音频文件已复制到: {target_audio_path}")
+            
+            # 容器内路径
+            container_audio_path = f"/code/data/{audio_filename}"
+        else:
+            raise FileNotFoundError(f"音频文件不存在: {audio_path}")
+
+        # 处理视频路径
+        if video_path.startswith("/home/kede/heygem_data/face2face/"):
+            video_filename = Path(video_path).name
+            container_video_path = f"/code/data/{video_filename}"
+        else:
+            container_video_path = video_path
+        
+        payload = {
+            "audio_url": container_audio_path,
+            "video_url": container_video_path,
+            "code": task_id,
+            "chaofen": 0,
+            "watermark_switch": 0,
+            "pn": 1
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+        
+        print(f"📤 视频合成参数:")
+        print(f"   音频路径: {container_audio_path}")
+        print(f"   视频路径: {container_video_path}")
+        print(f"   任务ID: {task_id}")
+        
+        try:
+            response = requests.post(
+                self.endpoints['video_submit'],
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            
+            print(f"📥 响应状态: {response.status_code}")
+            print(f"📥 响应内容: {response.text}")
+            
+            if response.status_code == 200:
+                print(f"✅ 视频合成任务已提交，任务ID: {task_id}")
+                return task_id
+            else:
+                print(f"❌ 视频合成提交失败: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ 视频合成提交异常: {e}")
+            return None
+    
+    def query_video_progress(self, task_id: str) -> Dict[str, Any]:
+        """查询视频合成进度"""
+        try:
+            response = requests.get(
+                f"{self.endpoints['video_query']}?code={task_id}",
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"❌ 查询进度失败: {response.status_code} - {response.text}")
+                return {}
+                
+        except Exception as e:
+            print(f"❌ 查询进度异常: {e}")
+            return {}
+    
+    def wait_for_completion(self, task_id: str, max_wait_time: int = 600) -> Optional[str]:
+        """
+        等待视频合成完成
+        """
+        print("⏳ 等待视频合成完成...")
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait_time:
+            progress = self.query_video_progress(task_id)
+            
+            if progress and 'data' in progress:
+                data = progress['data']
+                status_code = data.get("status", 0)
+                msg = data.get("msg", "")
+                result_path = data.get("result", "")
+                
+                print(f"   状态: {status_code}, 消息: {msg}")
+                
+                if status_code == 2:  # 完成
+                    print(f"🎉 视频合成完成: {result_path}")
+                    return result_path
+                elif status_code == 3:  # 失败
+                    print(f"❌ 视频合成失败: {msg}")
+                    return None
+                elif "三次获取音频时长失败" in str(msg):
+                    print(f"❌ 音频兼容性问题: {msg}")
+                    return None
+                
+            time.sleep(10)  # 每10秒查询一次
+        
+        print("⏰ 等待超时")
+        return None
+
+
+def debug_setup():
+    """检查和准备环境"""
+    print("=== 环境检查和设置 ===")
+    
+    # 检查必要的目录
+    directories = [
+        "/home/kede/heygem_data/face2face",
+        "/home/kede/heygem_data/f5_tts_output"
+    ]
+    
+    for dir_path in directories:
+        Path(dir_path).mkdir(parents=True, exist_ok=True)
+        print(f"✅ 目录已准备: {dir_path}")
+    
+    # 检查cn2an
+    try:
+        test_num = cn2an.an2cn(123)
+        print(f"✅ cn2an测试: 123 → {test_num}")
+    except Exception as e:
+        print(f"❌ cn2an测试失败: {e}")
+    
+    # 检查FFmpeg
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            print("✅ FFmpeg可用")
+        else:
+            print("❌ FFmpeg不可用")
+    except Exception as e:
+        print(f"❌ FFmpeg检查失败: {e}")
+    
+    # 检查F5-TTS
+    try:
+        result = subprocess.run(['f5-tts_infer-cli', '--help'], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            print("✅ F5-TTS命令行工具可用")
+        else:
+            print("❌ F5-TTS命令行工具不可用")
+    except Exception as e:
+        print(f"❌ F5-TTS检查失败: {e}")
+        print("请确保已安装F5-TTS: pip install f5-tts")
+
+
+def run_complete_workflow_with_f5tts():
+    """运行F5-TTS集成版的完整数字人创建工作流程"""
+    
+    # 配置参数 - 修正版
+    input_video = "./face2face/wang.mp4"  # 目标视频文件
+    ref_audio = ./voice_leijun.wav"     # F5-TTS参考音频文件
+    ref_text = "如果你想做一件事，就先去干， 哪怕做的很烂，哪怕一点都不完美，一个粗糙的开始就是最好的开始"  # 参考音频的文本内容
+    text_to_speak = "你好，我是通过AI技术创建的数字人。这是一个测试视频，展示了如何使用HeyGem和F5-TTS来创建个性化的数字人视频内容。技术改变世界，AI让未来更精彩。"  # 要合成的新文本
+    
+    print("=== HeyGem + F5-TTS 数字人合成工作流程 ===")
+    
+    # 环境检查
+    debug_setup()
+    
+    # 初始化API客户端
+    api = HeyGemF5TTSAPI()
+    
+    # 检查服务状态
+    print("\n🔍 检查服务状态...")
+    services = api.check_services()
+    for service, status in services.items():
+        print(f"   {service}: {'✅ 可用' if status else '❌ 不可用'}")
+    
+    if not services.get('video', False):
+        print("❌ 视频服务未正常运行，请检查Docker容器状态")
+        return
+    
+    if not services.get('f5_tts', False):
+        print("❌ F5-TTS不可用，请确保已正确安装")
+        return
+    
+    try:
+        # 检查输入文件
+        if not os.path.exists(input_video):
+            print(f"❌ 目标视频文件不存在: {input_video}")
+            return
+            
+        if not os.path.exists(ref_audio):
+            print(f"❌ F5-TTS参考音频文件不存在: {ref_audio}")
+            return
+        
+        print(f"\n📁 目标视频: {input_video}")
+        print(f"🎵 参考音频: {ref_audio}")
+        print(f"📝 参考文本: {ref_text}")
+        print(f"📝 合成文本: {text_to_speak}")
+        
+        # 步骤1: 准备视频文件
+        print("\n=== 步骤1: 准备视频文件 ===")
+        server_video_path = api.prepare_video_file(input_video)
+        
+        # 步骤2: F5-TTS语音合成
+        print("\n=== 步骤2: F5-TTS语音合成 ===")
+        synthesized_audio_path = api.synthesize_voice_with_f5tts(
+            text=text_to_speak,
+            ref_audio_path=ref_audio,  # 使用独立的参考音频文件
+            ref_text=ref_text          # 使用提供的参考文本
+        )
+        
+        if not synthesized_audio_path:
+            print("❌ F5-TTS语音合成失败，退出")
+            return
+        
+        # 步骤3: 视频合成
+        print("\n=== 步骤3: 视频合成 ===")
+        task_id = api.submit_video_synthesis(synthesized_audio_path, server_video_path)
+        
+        if not task_id:
+            print("❌ 视频合成提交失败，退出")
+            return
+        
+        # 步骤4: 等待完成
+        print("\n=== 步骤4: 等待合成完成 ===")
+        final_video = api.wait_for_completion(task_id, max_wait_time=600)
+        
+        if final_video:
+            print(f"\n🎉 成功！数字人视频生成完成！")
+            print(f"📹 输出视频: {final_video}")
+            print(f"🎵 合成音频: {synthesized_audio_path}")
+            print(f"🎤 使用的参考声音: {ref_audio}")
+        else:
+            print(f"\n❌ 视频生成失败或超时")
+            
+    except KeyboardInterrupt:
+        print("\n⚠️ 用户中断操作")
+    except Exception as e:
+        print(f"\n💥 运行过程中出现异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def test_f5tts_text_conversion():
+    """测试F5-TTS的文本转换功能"""
+    print("\n🧪 测试F5-TTS文本转换功能")
+    print("=" * 50)
+    
+    api = HeyGemF5TTSAPI()
+    
+    test_texts = [
+        "200+251=451这个数学很简单",
+        "今天是2024年1月1日",
+        "我有123个苹果和45.5元钱",
+        "100*2=200，500/5=100"
+    ]
+    
+    for text in test_texts:
+        print(f"\n原文: {text}")
+        converted = api.convert_text_numbers_cn2an(text)
+        print(f"转换: {converted}")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "debug":
+            # 只运行调试功能
+            debug_setup()
+        elif sys.argv[1] == "test":
+            # 测试文本转换
+            test_f5tts_text_conversion()
+        else:
+            print("用法:")
+            print("  python script.py        # 运行完整工作流程")
+            print("  python script.py debug  # 只运行环境检查")
+            print("  python script.py test   # 测试文本转换功能")
+    else:
+        # 运行完整版本
+        run_complete_workflow_with_f5tts()
