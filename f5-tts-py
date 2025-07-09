@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+F5-TTS Python推理脚本 - 使用cn2an进行数字转换
+专门使用cn2an库进行阿拉伯数字到中文的转换
+
+安装依赖:
+pip install cn2an
+
+cn2an功能介绍:
+- an2cn(): 阿拉伯数字转中文数字
+- cn2an(): 中文数字转阿拉伯数字  
+- transform(): 智能转换，自动识别数字类型
+"""
+
+import os
+import re
+import subprocess
+import argparse
+from pathlib import Path
+
+try:
+    import cn2an
+    print("✅ cn2an 库加载成功")
+except ImportError:
+    print("❌ 错误: 未安装 cn2an 库")
+    print("请安装: pip install cn2an")
+    exit(1)
+
+def test_cn2an_functions():
+    """
+    测试cn2an库的各种功能
+    """
+    print("\n🧪 cn2an 功能测试:")
+    print("-" * 40)
+    
+    # 测试基本数字转换
+    test_numbers = [0, 1, 10, 11, 20, 100, 101, 1000, 1234, 12345]
+    
+    print("📊 基本数字转换测试:")
+    for num in test_numbers:
+        try:
+            chinese = cn2an.an2cn(num)
+            print(f"  {num:>6} → {chinese}")
+        except Exception as e:
+            print(f"  {num:>6} → 转换失败: {e}")
+    
+    # 测试小数转换
+    print("\n📊 小数转换测试:")
+    decimal_numbers = [1.5, 10.25, 100.99, 0.5]
+    for num in decimal_numbers:
+        try:
+            # cn2an不直接支持小数，需要手动处理
+            integer_part = int(num)
+            decimal_part = str(num).split('.')[1]
+            chinese_integer = cn2an.an2cn(integer_part)
+            chinese_decimal = '点' + ''.join([cn2an.an2cn(int(d)) for d in decimal_part])
+            result = chinese_integer + chinese_decimal
+            print(f"  {num:>6} → {result}")
+        except Exception as e:
+            print(f"  {num:>6} → 转换失败: {e}")
+    
+    # 测试transform功能
+    print("\n📊 智能转换测试:")
+    test_texts = ["我有123个苹果", "价格是99.9元", "2024年1月1日"]
+    for text in test_texts:
+        try:
+            result = cn2an.transform(text, "an2cn")
+            print(f"  原文: {text}")
+            print(f"  转换: {result}")
+        except Exception as e:
+            print(f"  {text} → 转换失败: {e}")
+
+def convert_number_with_cn2an(num_str):
+    """
+    使用cn2an转换单个数字
+    """
+    try:
+        # 处理小数
+        if '.' in num_str:
+            integer_part, decimal_part = num_str.split('.')
+            chinese_integer = cn2an.an2cn(int(integer_part))
+            # 小数部分逐位转换
+            chinese_decimal = '点' + ''.join([cn2an.an2cn(int(d)) for d in decimal_part])
+            return chinese_integer + chinese_decimal
+        else:
+            # 整数直接转换
+            return cn2an.an2cn(int(num_str))
+    except Exception as e:
+        print(f"⚠️  数字转换警告: {num_str} → {e}")
+        return num_str  # 转换失败时返回原数字
+
+def convert_math_expression(expr_str):
+    """
+    转换数学表达式
+    """
+    try:
+        # 分离表达式和结果
+        if '=' in expr_str:
+            expression, result = expr_str.split('=', 1)
+        else:
+            expression = expr_str
+            result = None
+        
+        # 替换运算符
+        chinese_expr = expression.strip()
+        chinese_expr = re.sub(r'\+', ' 加 ', chinese_expr)
+        chinese_expr = re.sub(r'-', ' 减 ', chinese_expr)
+        chinese_expr = re.sub(r'\*', ' 乘以 ', chinese_expr)
+        chinese_expr = re.sub(r'/', ' 除以 ', chinese_expr)
+        
+        # 转换表达式中的数字
+        number_pattern = r'\d+(?:\.\d+)?'
+        chinese_expr = re.sub(number_pattern, 
+                             lambda m: convert_number_with_cn2an(m.group()), 
+                             chinese_expr)
+        
+        # 处理结果部分
+        if result:
+            chinese_result = convert_number_with_cn2an(result.strip())
+            return chinese_expr + ' 等于 ' + chinese_result
+        else:
+            return chinese_expr
+            
+    except Exception as e:
+        print(f"⚠️  表达式转换警告: {expr_str} → {e}")
+        return expr_str
+
+def convert_text_numbers_cn2an(text):
+    """
+    使用cn2an转换文本中的所有数字
+    """
+    print(f"\n📝 开始转换文本中的数字...")
+    print(f"原始文本: {text}")
+    
+    # 方法1: 使用cn2an的transform功能（推荐）
+    try:
+        # cn2an.transform 可以智能识别并转换文本中的数字
+        result = cn2an.transform(text, "an2cn")
+        print(f"cn2an.transform结果: {result}")
+        
+        # 额外处理数学表达式
+        math_pattern = r'\b\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?:\s*=\s*\d+(?:\.\d+)?)?\b'
+        
+        def replace_math(match):
+            return convert_math_expression(match.group())
+        
+        final_result = re.sub(math_pattern, replace_math, result)
+        print(f"最终结果: {final_result}")
+        
+        return final_result
+        
+    except Exception as e:
+        print(f"❌ cn2an.transform 转换失败: {e}")
+        
+        # 方法2: 手动处理（备用方案）
+        print("🔄 使用手动转换方案...")
+        
+        # 先处理数学表达式
+        math_pattern = r'\b\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?:\s*=\s*\d+(?:\.\d+)?)?\b'
+        result = re.sub(math_pattern, lambda m: convert_math_expression(m.group()), text)
+        
+        # 再处理剩余的单独数字
+        number_pattern = r'\b\d+(?:\.\d+)?\b'
+        result = re.sub(number_pattern, lambda m: convert_number_with_cn2an(m.group()), result)
+        
+        return result
+
+def run_f5_tts_with_cn2an(model, ref_audio, ref_text, gen_text, output_dir):
+    """
+    运行 F5-TTS 推理，使用cn2an进行数字转换
+    """
+    print("\n🚀 开始 F5-TTS 推理...")
+    print("=" * 60)
+    
+    # 使用cn2an预处理生成文本
+    processed_gen_text = convert_text_numbers_cn2an(gen_text)
+    
+    print(f"\n📋 转换对比:")
+    print(f"原始文本: {gen_text}")
+    print(f"转换文本: {processed_gen_text}")
+    
+    # 确保输出目录存在
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # 构建命令
+    cmd = [
+        "f5-tts_infer-cli",
+        "--model", model,
+        "--ref_audio", ref_audio,
+        "--ref_text", ref_text,
+        "--gen_text", processed_gen_text,
+        "--output_dir", output_dir
+    ]
+    
+    print(f"\n💻 执行命令:")
+    print(" ".join([f'"{arg}"' if ' ' in arg else arg for arg in cmd]))
+    
+    try:
+        # 运行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+        
+        if result.returncode == 0:
+            print("\n✅ F5-TTS 推理成功完成！")
+            print(f"📁 输出保存到: {output_dir}")
+            if result.stdout:
+                print(f"📋 输出信息: {result.stdout}")
+        else:
+            print("\n❌ F5-TTS 推理失败！")
+            print(f"❌ 错误信息: {result.stderr}")
+            
+        return result.returncode == 0
+        
+    except FileNotFoundError:
+        print("\n❌ 错误: 找不到 f5-tts_infer-cli 命令")
+        print("请确保已正确安装 F5-TTS 并且命令在 PATH 中")
+        return False
+    except Exception as e:
+        print(f"\n❌ 运行过程中出现错误: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description='F5-TTS Python 推理脚本（使用cn2an数字转换）')
+    parser.add_argument('--model', default='F5TTS_v1_Base', help='模型名称')
+    parser.add_argument('--ref_audio', required=True, help='参考音频文件路径')
+    parser.add_argument('--ref_text', required=True, help='参考文本')
+    parser.add_argument('--gen_text', required=True, help='要生成的文本')
+    parser.add_argument('--output_dir', default='./output_f5_tts', help='输出目录')
+    parser.add_argument('--test', action='store_true', help='运行cn2an功能测试')
+    
+    args = parser.parse_args()
+    
+    # 运行测试
+    if args.test:
+        test_cn2an_functions()
+        return True
+    
+    # 检查参考音频文件
+    if not os.path.exists(args.ref_audio):
+        print(f"❌ 错误: 参考音频文件不存在: {args.ref_audio}")
+        return False
+    
+    # 运行 F5-TTS
+    success = run_f5_tts_with_cn2an(
+        model=args.model,
+        ref_audio=args.ref_audio,
+        ref_text=args.ref_text,
+        gen_text=args.gen_text,
+        output_dir=args.output_dir
+    )
+    
+    return success
+
+if __name__ == "__main__":
+    print("🎵 F5-TTS cn2an 数字转换脚本")
+    print("=" * 60)
+    
+    # 如果没有参数，运行示例
+    if len(os.sys.argv) == 1:
+        print("📖 运行内置示例...")
+        
+        # 先运行测试
+        print("\n🧪 运行 cn2an 功能测试:")
+        test_cn2an_functions()
+        
+        # 示例配置
+        model = "F5TTS_v1_Base"
+        ref_audio = "/home/kede/2025/F5-TTS/voice_leijun.wav"
+        ref_text = "如果你想做一件事，就先去干， 哪怕做的很烂，哪怕一点都不完美，一个粗糙的开始就是最好的开始"
+        gen_text = "你好，200+251=451这个数学很简单。我是通过AI技术创建的数字人。这是一个测试视频，展示了如何使用HeyGem来创建个性化的数字人视频内容。技术改变世界，AI让未来更精彩。"
+        output_dir = "./output_f5_tts"
+        
+        print(f"\n📝 命令行使用示例:")
+        print("python f5_tts_cn2an.py \\")
+        print(f'  --ref_audio "{ref_audio}" \\')
+        print(f'  --ref_text "{ref_text}" \\')
+        print(f'  --gen_text "{gen_text}" \\')
+        print(f'  --output_dir "{output_dir}"')
+        
+        print(f"\n🧪 仅运行测试:")
+        print("python f5_tts_cn2an.py --test")
+        
+        # 检查音频文件是否存在
+        if not os.path.exists(ref_audio):
+            print(f"\n⚠️  警告: 参考音频文件不存在: {ref_audio}")
+            print("请修改脚本中的 ref_audio 路径，或使用命令行参数指定正确路径")
+            exit(1)
+        
+        success = run_f5_tts_with_cn2an(model, ref_audio, ref_text, gen_text, output_dir)
+        exit(0 if success else 1)
+    else:
+        success = main()
+        exit(0 if success else 1)
